@@ -19,6 +19,20 @@ LABELS = {
 }
 
 
+def _set_language(doc, language: str) -> None:
+    tag = {"tr": "tr-TR", "en": "en-US"}.get(language, language)
+    rpr = doc.styles["Normal"].element.get_or_add_rPr()
+    lang = rpr.find(qn("w:lang"))
+    if lang is None:
+        lang = OxmlElement("w:lang")
+        rpr.append(lang)
+    lang.set(qn("w:val"), tag)
+    defaults = doc.styles.element.find(qn("w:docDefaults"))
+    if defaults is not None:
+        for el in defaults.iter(qn("w:lang")):
+            el.set(qn("w:val"), tag)
+
+
 def _paragraphs(doc):
 
     def walk(container):
@@ -62,13 +76,15 @@ def _fill_paragraph(p, values: dict[str, list[str]]) -> None:
     runs[0].text = joined
 
 
-def fill_template(template: bytes, values: dict[str, list[str]]) -> bytes:
+def fill_template(template: bytes, values: dict[str, list[str]], language: str = "") -> bytes:
     try:
         doc = Document(io.BytesIO(template))
     except Exception as e:
         raise DocError("invalid-template") from e
     for p in list(_paragraphs(doc)):
         _fill_paragraph(p, values)
+    if language:
+        _set_language(doc, language)
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
@@ -98,6 +114,7 @@ def build_from_definition(
     style = doc.styles["Normal"]
     style.font.name = lh["font_family"]
     style.font.size = Pt(lh["font_size"])
+    _set_language(doc, report["language"])
     sec = doc.sections[0]
     head = sec.header.paragraphs[0]
     if logo:
@@ -156,5 +173,5 @@ def render_report(
     definition: dict, report: dict, template: bytes | None, logo: bytes | None, signature: bytes | None
 ) -> bytes:
     if template:
-        return fill_template(template, values_for(report))
+        return fill_template(template, values_for(report), report["language"])
     return build_from_definition(definition, report, logo, signature)

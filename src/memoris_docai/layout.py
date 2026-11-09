@@ -81,6 +81,7 @@ def _span_from(src: dict[str, Any], chars: list[dict[str, Any]], icon: bool) -> 
         "bbox": box,
         "font": src.get("font") or "",
         "size": round(src["size"], 2),
+        "baseline": chars[0]["origin"][1],
         "color": _color(src["color"]),
         "bold": bool(src["flags"] & 16),
         "italic": bool(src["flags"] & 2),
@@ -362,6 +363,68 @@ def _span_bbox(spans: list[dict[str, Any]]) -> list[float]:
     ]
 
 
+def _value_bearing(ch: str) -> bool:
+    if ch.isascii():
+        return False
+    form = unicodedata.decomposition(ch)
+    if form.startswith("<square>"):
+        return any(c.isdigit() for c in unicodedata.normalize("NFKC", ch))
+    return ch == "\u00b5" or form.startswith(("<super>", "<sub>", "<fraction>"))
+
+
+def fold_forms(text: str) -> str:
+    out: list[str] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if _value_bearing(ch):
+            out.append(unicodedata.normalize("NFKC", text[start:i]))
+            out.append(ch)
+            start = i + 1
+    out.append(unicodedata.normalize("NFKC", text[start:]))
+    return "".join(out)
+
+
+_SCRIPT_TEXT = re.compile(r"[+\-\u2212]?\d+")
+_SUPERSCRIPT = str.maketrans("0123456789+-\u2212", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻")
+_SUBSCRIPT = str.maketrans("0123456789+-\u2212", "₀₁₂₃₄₅₆₇₈₉₊₋₋")
+
+
+def script_kind(base_size: float, base_y: float, size: float, y: float, text: str) -> str | None:
+    if size >= base_size * 0.9 or not _SCRIPT_TEXT.fullmatch(text.strip()):
+        return None
+    if y < base_y - base_size * 0.1:
+        return "sup"
+    if y > base_y + base_size * 0.1:
+        return "sub"
+    return None
+
+
+def _join_spans(spans: list[dict[str, Any]]) -> str:
+    out = ""
+    prev = ""
+    base: dict[str, Any] | None = None
+    for span in spans:
+        raw = span["text"]
+        text = raw.strip()
+        kind = None
+        if base and text and "baseline" in span and "baseline" in base:
+            kind = script_kind(base["size"], base["baseline"], span["size"], span["baseline"], text)
+        if kind:
+            out += text.translate(_SUPERSCRIPT if kind == "sup" else _SUBSCRIPT)
+            prev = raw
+            continue
+        if text:
+            base = span
+        if out and text:
+            glued = not prev[-1:].isspace() and not raw[:1].isspace()
+            if not (glued and (_value_bearing(out[-1]) or _value_bearing(text[0]))):
+                out += " "
+        out += text
+        if text:
+            prev = raw
+    return out
+
+
 def segment(layout: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for p in layout["pages"]:
@@ -391,8 +454,8 @@ def segment(layout: dict[str, Any]) -> list[dict[str, Any]]:
                 if not text_lines:
                     continue
                 spans = [s for ln in text_lines for s in ln["spans"]]
-                text = "\n".join(" ".join(s["text"].strip() for s in ln["spans"]) for ln in text_lines)
-                text = unicodedata.normalize("NFKC", text)
+                text = "\n".join(_join_spans(ln["spans"]) for ln in text_lines)
+                text = fold_forms(text)
                 h = hashlib.sha256(text.encode()).hexdigest()[:8]
                 horizontal = all(abs(ln["dir"][1]) < 1e-3 for ln in text_lines)
                 out.append(

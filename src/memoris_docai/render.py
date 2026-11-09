@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 import pymupdf
@@ -236,6 +237,57 @@ def soft_join(text: str) -> str:
     return " ".join(lines)
 
 
+_SIGNED = re.compile(r"(?<![\w)\]])([-+\u2212])(?=[.,]?[0-9])")
+
+
+_NASKH_UNMAPPED = {
+    0x01BE: "\u0644",
+    0x01C2: "\u0644",
+    0x01C1: "\u0644",
+    0x01C4: "\u0644",
+    0x0006: "\u0627",
+    0x0009: "\u0623",
+    0x000C: "\u0625",
+    0x0015: "\u0622",
+    0x0628: "\u0627",
+    0x062E: "\u0623",
+    0x062F: "\u0625",
+    0x062A: "\u0622",
+}
+
+
+def _font_xrefs(doc: pymupdf.Document) -> set[int]:
+    return {x for x in range(1, doc.xref_length()) if doc.xref_get_key(x, "BaseFont")[0] == "name"}
+
+
+def _complete_arabic_text_layer(doc: pymupdf.Document, source_fonts: set[int]) -> None:
+    for xref in _font_xrefs(doc) - source_fonts:
+        if "Noto Naskh Arabic" not in doc.xref_get_key(xref, "BaseFont")[1].replace("#20", " "):
+            continue
+        kind, value = doc.xref_get_key(xref, "ToUnicode")
+        if kind != "xref":
+            continue
+        stream = int(value.split()[0])
+        cmap = doc.xref_stream(stream).decode("latin-1")
+        lines = "\n".join(
+            f"<{gid:04x}> <{ord(ch):04x}>" for gid, ch in _NASKH_UNMAPPED.items() if not _mapped(cmap, gid)
+        )
+        if lines:
+            added = f"{lines.count(chr(10)) + 1} beginbfchar\n{lines}\nendbfchar\nendcmap"
+            doc.update_stream(stream, cmap.replace("endcmap", added, 1).encode("latin-1"))
+
+
+def _mapped(cmap: str, gid: int) -> bool:
+    for low, high in re.findall(r"^<([0-9a-fA-F]{4})> <([0-9a-fA-F]{4})> <", cmap, flags=re.MULTILINE):
+        if int(low, 16) <= gid <= int(high, 16):
+            return True
+    return re.search(rf"^<{gid:04x}> <[0-9a-fA-F]+>$", cmap, flags=re.MULTILINE | re.IGNORECASE) is not None
+
+
+def ltr_signs(text: str) -> str:
+    return _SIGNED.sub("\u200e\\1", text)
+
+
 def _html(text: str, bold_label: bool = False, bold: bool = False) -> str:
     text = soft_join(text)
     out = []
@@ -365,6 +417,7 @@ def render(
     pages: list[int] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     doc = open_pdf(source)
+    source_fonts = _font_xrefs(doc)
     rtl = target_lang in RTL
     by_page: dict[int, list[dict[str, Any]]] = {}
     for s in segments:
@@ -453,13 +506,15 @@ def render(
                 f" vertical-align: baseline; }}"
             )
             text = translations.get(s["id"], identity.get(s["id"], s["text"]))
-            body = _html(text, s.get("bold_label", False), s.get("bold", False))
+            drawn = ltr_signs(text) if rtl else text
+            body = _html(drawn, s.get("bold_label", False), s.get("bold", False))
             fit, scale, mode = _write_at_floor(page, rect, body, css, text)
             results.append(
                 {"id": s["id"], "page": page_no, "fit": fit, "scale": round(scale, 3), "mode": mode}
             )
 
     doc.subset_fonts()
+    _complete_arabic_text_layer(doc, source_fonts)
     if pages is not None:
         keep = sorted({p - 1 for p in _page_set(doc.page_count, pages)})
         doc.select(keep)
