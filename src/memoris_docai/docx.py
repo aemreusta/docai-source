@@ -5,6 +5,7 @@ import logging
 import re
 import tempfile
 import unicodedata
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -87,7 +88,10 @@ def _polish(docx: bytes, pdf: bytes) -> bytes:
             "NFKC", "\n".join(page.get_text("text", flags=_TEXT_FLAGS) for page in src)
         )
         marks = _script_marks(src)
+        chunks = _pdf_chunks(src)
+        lines = _Lines(chunks)
         for paragraph in _body_paragraphs(d):
+            _logical_order(paragraph, lines)
             _restore_spaces(paragraph, pdf_text)
             _mark_scripts(paragraph, marks)
         _promote_margins(d, src)
@@ -105,6 +109,7 @@ def _polish(docx: bytes, pdf: bytes) -> bytes:
                         for cell in row.cells:
                             for paragraph in cell.paragraphs:
                                 _mark_rtl(paragraph)
+        _check_number_order(_body_paragraphs(d), chunks)
     finally:
         src.close()
     buf = io.BytesIO()
@@ -584,11 +589,142 @@ def _clone_part(source, target) -> None:
         elm.append(deepcopy(child))
 
 
-def _mark_rtl(paragraph: Paragraph) -> None:
-    text = paragraph.text or ""
+def _has_rtl(text: str) -> bool:
+    return any("\u0590" <= ch <= "\u08ff" for ch in text)
+
+
+def _is_rtl(text: str) -> bool:
     rtl = sum(1 for ch in text if "\u0590" <= ch <= "\u08ff")
     latin = sum(1 for ch in text if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ("\u00c0" <= ch <= "\u024f"))
-    if rtl < 4 or rtl <= latin:
+    return rtl >= 4 and rtl > latin
+
+
+def _pdf_chunks(src: pymupdf.Document) -> list[str]:
+    chunks = []
+    for page in src:
+        for block in page.get_text("dict", flags=_TEXT_FLAGS)["blocks"]:
+            for line in block.get("lines", []):
+                text = _compact("".join(span["text"] for span in line["spans"]))
+                if text:
+                    chunks.append(text)
+    return chunks
+
+
+def _segment(texts: list[str], wanted: set[str], start: int = 0) -> list[int] | None:
+    if start == len(texts):
+        return []
+    group = ""
+    for end in range(start + 1, len(texts) + 1):
+        group += texts[end - 1]
+        if len(group) > _LONGEST_LINE:
+            return None
+        if group in wanted:
+            rest = _segment(texts, wanted, end)
+            if rest is not None:
+                return [end, *rest]
+    return None
+
+
+_LONGEST_LINE = 2000
+
+
+class _Lines:
+
+    def __init__(self, chunks: list[str]):
+        self.chunks = chunks
+        self.used: set[int] = set()
+        self.after = 0
+
+    def find(self, need: Counter, n: int) -> int | None:
+        free = [w for w in range(len(self.chunks) - n + 1) if Counter(self.chunks[w : w + n]) == need]
+        free = [w for w in free if not self.used.intersection(range(w, w + n))]
+        later = [w for w in free if w >= self.after]
+        window = (later or free or [None])[0]
+        if window is not None:
+            self.used.update(range(window, window + n))
+            self.after = window + n
+        return window
+
+
+def _logical_order(paragraph: Paragraph, lines: _Lines) -> None:
+    chunks = lines.chunks
+    runs = paragraph.runs
+    if (
+        len(runs) < 2
+        or not _is_rtl(paragraph.text or "")
+        or any(r._r.getparent() is not paragraph._p for r in runs)
+    ):
+        return
+    texts = [_compact(r.text or "") for r in runs]
+    if not all(texts):
+        return
+    wanted = set(chunks)
+    ends = _segment(texts, wanted)
+    if ends is None or len(ends) < 2:
+        return
+    groups, start = [], 0
+    for end in ends:
+        groups.append((runs[start:end], "".join(texts[start:end])))
+        start = end
+    need = Counter(text for _, text in groups)
+    n = len(groups)
+    window = lines.find(need, n)
+    if window is None:
+        return
+    waiting: dict[str, list] = {}
+    for group, text in groups:
+        waiting.setdefault(text, []).append(group)
+    placed = [(i, waiting[chunks[window + i]].pop(0)) for i in range(n)]
+    first = runs[0]._r
+    parent = first.getparent()
+    index = parent.index(first)
+    for _, group in placed:
+        for run in group:
+            parent.remove(run._r)
+    for _, group in placed:
+        for run in group:
+            parent.insert(index, run._r)
+            index += 1
+
+
+_NUMBER_TOKEN = re.compile(r"[-+\u2212]?\d+(?:[.,]\d+)*")
+
+
+def _numbers(text: str) -> list[str]:
+    return _NUMBER_TOKEN.findall(unicodedata.normalize("NFKC", text).replace("\u200e", ""))
+
+
+def _check_number_order(paragraphs: list[Paragraph], chunks: list[str]) -> None:
+    reference = _numbers("".join(chunks))
+    seen = "\n".join(" ".join(reference[i:]) for i in range(len(reference)))
+    for paragraph in paragraphs:
+        text = paragraph.text or ""
+        if not _is_rtl(text):
+            continue
+        found = _numbers(text)
+        if len(found) > 1 and " ".join(found) not in seen:
+            raise DocError("docx-reading-order")
+
+
+_LATIN_WITH_DIGITS = re.compile(
+    r"[A-Za-z\u00b5\u03bc].*[0-9\u00b2\u00b3\u00b9\u2070-\u2079/]|[0-9\u00b2\u00b3\u00b9\u2070-\u2079/].*[A-Za-z\u00b5\u03bc]"
+)
+
+
+def _ltr_island(text: str) -> str:
+    core = text.strip()
+    if not core or not _LATIN_WITH_DIGITS.search(core):
+        return text
+    start = text.index(core)
+    if not core.startswith("\u200e"):
+        core = "\u200e" + core
+    if not core.endswith("\u200e"):
+        core += "\u200e"
+    return f"{text[:start]}{core}{text[start + len(text.strip()) :]}"
+
+
+def _mark_rtl(paragraph: Paragraph) -> None:
+    if not _is_rtl(paragraph.text or ""):
         return
     p_pr = paragraph._p.get_or_add_pPr()
     if p_pr.find(qn("w:bidi")) is None:
@@ -598,8 +734,9 @@ def _mark_rtl(paragraph: Paragraph) -> None:
         signed = ltr_signs(text)
         if signed != text:
             run.text = signed
-            if not any("\u0590" <= ch <= "\u08ff" for ch in text):
-                continue
+        if not _has_rtl(text):
+            run.text = _ltr_island(run.text or "")
+            continue
         r_pr = run._r.get_or_add_rPr()
         if r_pr.find(qn("w:rtl")) is None:
             r_pr.append(OxmlElement("w:rtl"))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import warnings
 
 import numpy as np
 import pymupdf
@@ -19,11 +20,12 @@ except ImportError:
 
 MAX_PAGES = 30
 MAX_PIXELS = 60_000_000
+MAX_FILE_PIXELS = 120_000_000
 DEFAULT_DPI = 200
 FORMATS = {"JPEG", "PNG", "TIFF", "WEBP", "HEIF", "MPO"}
 MAX_SKEW = 5.0
 
-Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS // 2
 
 
 def kind(data: bytes) -> str | None:
@@ -44,16 +46,35 @@ def kind(data: bytes) -> str | None:
 
 def frames(data: bytes) -> list[Image.Image]:
     try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as e:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            img = Image.open(io.BytesIO(data))
+    except Image.DecompressionBombError as e:
+        raise DocError("image-too-large") from e
+    except (UnidentifiedImageError, OSError, ValueError) as e:
         raise DocError("unsupported-image") from e
     if img.format not in FORMATS:
         raise DocError("unsupported-image")
+    frame_count = getattr(img, "n_frames", 1)
+    if frame_count > MAX_PAGES:
+        raise DocError("too-many-pages")
     out = []
-    for i in range(getattr(img, "n_frames", 1)):
-        img.seek(i)
-        frame = ImageOps.exif_transpose(img.copy())
+    total = 0
+    for i in range(frame_count):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                img.seek(i)
+                pixels = img.width * img.height
+                total += pixels
+                if pixels > MAX_PIXELS or total > MAX_FILE_PIXELS:
+                    raise DocError("image-too-large")
+                img.load()
+                frame = ImageOps.exif_transpose(img)
+        except Image.DecompressionBombError as e:
+            raise DocError("image-too-large") from e
+        except (UnidentifiedImageError, OSError, ValueError, EOFError) as e:
+            raise DocError("unsupported-image") from e
         if frame.mode not in ("RGB", "L"):
             frame = (
                 frame.convert("RGBA").convert("RGB")

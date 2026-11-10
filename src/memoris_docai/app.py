@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 import posixpath
 
-import pymupdf
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from . import images, storage
+from . import guard, images, storage
 from .docx import pdf_to_docx
-from .layout import DocError, extract, open_pdf, segment
+from .layout import DocError, extract, page_image, preview_pdf, segment
 from .render import render
 from .report import render_report
+
+TIMEOUT_EXTRACT = 280
+TIMEOUT_RENDER = 280
+TIMEOUT_NORMALIZE = 90
+TIMEOUT_PREVIEW = 90
+TIMEOUT_DOCX = 110
+TIMEOUT_REPORT = 110
 
 app = FastAPI(title="memoris-docai", docs_url=None, redoc_url=None)
 store: storage.Storage = storage.from_env()
@@ -21,6 +27,11 @@ store: storage.Storage = storage.from_env()
 @app.exception_handler(DocError)
 async def doc_error(_, e: DocError):
     return JSONResponse(status_code=422, content={"code": e.code})
+
+
+@app.exception_handler(guard.Busy)
+async def busy(_, e: guard.Busy):
+    return JSONResponse(status_code=503, content={"code": "busy"})
 
 
 @app.exception_handler(ValueError)
@@ -45,7 +56,7 @@ class NormalizeIn(BaseModel):
 
 @app.post("/v1/normalize")
 def do_normalize(r: NormalizeIn):
-    pdf, pages = images.to_pdf([store.get(k) for k in r.source_keys])
+    pdf, pages = guard.run(images.to_pdf, [store.get(k) for k in r.source_keys], timeout=TIMEOUT_NORMALIZE)
     store.put(r.out_key, pdf, "application/pdf")
     return {"pdf_key": r.out_key, "page_count": pages}
 
@@ -60,7 +71,7 @@ class ExtractIn(BaseModel):
 
 @app.post("/v1/extract")
 def do_extract(r: ExtractIn):
-    layout = extract(store.get(r.source_key), source_lang=r.source_lang, pages=r.pages)
+    layout = guard.run(extract, store.get(r.source_key), r.source_lang, r.pages, timeout=TIMEOUT_EXTRACT)
     key = storage.sibling(r.source_key, "layout.json")
     store.put(key, json.dumps(layout).encode(), "application/json")
     return {
@@ -106,8 +117,12 @@ class RenderIn(BaseModel):
 def do_render(r: RenderIn):
     segs = json.loads(store.get(storage.sibling(r.layout_key, "segments.json")))
     raw = json.loads(store.get(r.translations_key))
-    translations = {t["id"]: t["text"] for t in raw} if isinstance(raw, list) else raw
-    pdf, report = render(store.get(r.source_key), segs, translations, r.target_lang, pages=r.pages)
+    translations = (
+        {t["id"]: t["text"] for t in raw if t.get("by") != "keep"} if isinstance(raw, list) else raw
+    )
+    pdf, report = guard.run(
+        render, store.get(r.source_key), segs, translations, r.target_lang, r.pages, timeout=TIMEOUT_RENDER
+    )
     name = f"translated.{r.target_lang}.pdf"
     if r.result_version is not None:
         name = f"translated.{r.target_lang}.v{r.result_version}.pdf"
@@ -122,24 +137,23 @@ class PreviewIn(BaseModel):
 
 @app.post("/v1/preview")
 def do_preview(r: PreviewIn):
-    data = store.get(r.source_key)
-    doc = open_pdf(data)
-    chunks = []
-    for page in doc:
-        chunks.append(page.get_text("text"))
-        rect = page.rect
-        longest = max(rect.width, rect.height) or 1
-        scale = min(1.0, 160.0 / longest)
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
-        if max(pix.width, pix.height) > 160:
-            raise DocError("thumbnail")
-        store.put(
-            storage.sibling(r.source_key, f"thumb-{page.number + 1}.jpg"), pix.tobytes("jpeg"), "image/jpeg"
-        )
-    text = "\n".join(chunks)[:8000]
+    page_count, text, thumbs = guard.run(preview_pdf, store.get(r.source_key), timeout=TIMEOUT_PREVIEW)
+    for number, jpeg in enumerate(thumbs, start=1):
+        store.put(storage.sibling(r.source_key, f"thumb-{number}.jpg"), jpeg, "image/jpeg")
     text_key = storage.sibling(r.source_key, "preview.txt")
     store.put(text_key, text.encode(), "text/plain")
-    return {"page_count": doc.page_count, "text_key": text_key}
+    return {"page_count": page_count, "text_key": text_key}
+
+
+class PageImageIn(BaseModel):
+    source_key: str
+    page: int = Field(ge=1, le=30)
+
+
+@app.post("/v1/page-image")
+def do_page_image(r: PageImageIn):
+    jpeg = guard.run(page_image, store.get(r.source_key), r.page, timeout=TIMEOUT_PREVIEW)
+    return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 class DocxIn(BaseModel):
@@ -148,7 +162,7 @@ class DocxIn(BaseModel):
 
 @app.post("/v1/docx")
 def do_docx(r: DocxIn):
-    docx, stats = pdf_to_docx(store.get(r.source_key))
+    docx, stats = guard.run(pdf_to_docx, store.get(r.source_key), timeout=TIMEOUT_DOCX)
     base = posixpath.basename(r.source_key)
     name = (base[:-4] if base.lower().endswith(".pdf") else base) + ".docx"
     key = storage.sibling(r.source_key, name)
@@ -185,8 +199,14 @@ def do_report(r: ReportIn):
     def opt(key: str | None) -> bytes | None:
         return store.get(key) if key else None
 
-    docx = render_report(
-        r.definition, r.report.model_dump(), opt(r.template_key), opt(r.logo_key), opt(r.signature_key)
+    docx = guard.run(
+        render_report,
+        r.definition,
+        r.report.model_dump(),
+        opt(r.template_key),
+        opt(r.logo_key),
+        opt(r.signature_key),
+        timeout=TIMEOUT_REPORT,
     )
     key = storage.sibling(r.source_key, r.name)
     store.put(key, docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")

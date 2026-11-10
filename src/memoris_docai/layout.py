@@ -10,6 +10,8 @@ import pymupdf
 from . import ocr
 
 MAX_PAGES = 30
+MAX_PAGE_AREA_PT2 = 2_100_000
+MAX_PAGE_IMAGE_PIXELS = 80_000_000
 
 
 class DocError(Exception):
@@ -30,7 +32,40 @@ def open_pdf(data: bytes) -> pymupdf.Document:
         raise DocError("empty")
     if doc.page_count > MAX_PAGES:
         raise DocError("too-many-pages")
+    for page in doc:
+        check_page(doc, page)
     return doc
+
+
+def check_page(doc: pymupdf.Document, page: pymupdf.Page) -> None:
+    if page.rect.width * page.rect.height > MAX_PAGE_AREA_PT2:
+        raise DocError("page-too-large")
+    if sum(img[2] * img[3] for img in doc.get_page_images(page.number)) > MAX_PAGE_IMAGE_PIXELS:
+        raise DocError("page-too-large")
+
+
+def preview_pdf(data: bytes) -> tuple[int, str, list[bytes]]:
+    doc = open_pdf(data)
+    chunks, thumbs = [], []
+    for page in doc:
+        chunks.append(page.get_text("text"))
+        rect = page.rect
+        longest = max(rect.width, rect.height) or 1
+        scale = min(1.0, 160.0 / longest)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+        if max(pix.width, pix.height) > 160:
+            raise DocError("thumbnail")
+        thumbs.append(pix.tobytes("jpeg"))
+    return doc.page_count, "\n".join(chunks)[:8000], thumbs
+
+
+def page_image(data: bytes, page: int, longest_px: int = 1000) -> bytes:
+    doc = open_pdf(data)
+    if not 1 <= page <= doc.page_count:
+        raise DocError("invalid-page")
+    p = doc[page - 1]
+    scale = min(2.0, longest_px / (max(p.rect.width, p.rect.height) or 1))
+    return p.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("jpeg")
 
 
 def _color(c: int) -> str:
