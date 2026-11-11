@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from itertools import pairwise
 from typing import Any
 
 import pymupdf
@@ -238,6 +239,7 @@ def soft_join(text: str) -> str:
 
 
 _SIGNED = re.compile(r"(?<![\w)\]])([-+\u2212])(?=[.,]?[0-9])")
+_RANGE_SOFT_HYPHEN = re.compile(r"(?<=\d)([^\S\n]*)\u00ad([^\S\n]*)(?=[+\-\u2212]?\d)")
 
 
 _NASKH_UNMAPPED = {
@@ -289,6 +291,7 @@ def ltr_signs(text: str) -> str:
 
 
 def _html(text: str, bold_label: bool = False, bold: bool = False) -> str:
+    text = _RANGE_SOFT_HYPHEN.sub(r"\1-\2", text)
     text = soft_join(text)
     out = []
     for line in text.split("\n"):
@@ -312,6 +315,26 @@ def _identity_siblings(page_segs: list[dict[str, Any]], translated_ids: set[str]
             if s["id"] not in translated_ids and s.get("kind") != "glyph":
                 extra[s["id"]] = s["text"]
     return extra
+
+
+def _form_fields(segs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    fields = {}
+    for row in _row_groups(segs):
+        ordered = sorted(row, key=lambda s: s["bbox"][0])
+        for label, value in pairwise(ordered):
+            if (
+                label["bold"]
+                and label["text"].rstrip().endswith(":")
+                and not value["bold"]
+                and value.get("kind") != "glyph"
+                and label["lines"] == value["lines"] == 1
+                and label["size"] == value["size"]
+                and label["color"] == value["color"]
+                and abs(label["bbox"][1] - value["bbox"][1]) <= 1
+                and -0.5 <= value["bbox"][0] - label["bbox"][2] <= label["size"]
+            ):
+                fields[label["id"]] = value
+    return fields
 
 
 def _vertical_grids(page: pymupdf.Page) -> list[list[dict[str, Any]]]:
@@ -388,7 +411,7 @@ def grid_cell_boxes(segs: list[dict[str, Any]], grids: list[list[dict[str, Any]]
 
 
 def _write_at_floor(
-    page: pymupdf.Page, rect: pymupdf.Rect, body: str, css: str, text: str
+    page: pymupdf.Page, rect: pymupdf.Rect, body: str, css: str, text: str, *, fixed: bool = False
 ) -> tuple[bool, float, str]:
     bottom = page.rect.y1 - PAGE_MARGIN
     tries = [
@@ -402,6 +425,8 @@ def _write_at_floor(
         ),
     ]
     for mode, r in tries:
+        if fixed and mode != "box":
+            break
         spare, scale = page.insert_htmlbox(r, body, css=css, scale_low=MIN_SCALE)
         if spare >= 0:
             return mode == "box", scale, mode
@@ -455,6 +480,12 @@ def render(
         else:
             write_box = {s["id"]: list(s["bbox"]) for s in all_by_page[page_no]}
             no_grow = set()
+        fields = {} if rtl else _form_fields(segs)
+        field_values = {v["id"] for v in fields.values()}
+        for label_id, value in fields.items():
+            label_box = pymupdf.Rect(write_box[label_id])
+            label_box |= pymupdf.Rect(write_box[value["id"]])
+            write_box[label_id] = list(label_box)
         rects = {
             s["id"]: available(
                 pymupdf.Rect(write_box[s["id"]]),
@@ -488,7 +519,10 @@ def render(
         sizes = sorted(o["size"] for o in all_by_page[page_no])
         median = sizes[len(sizes) // 2] if sizes else 10.0
         for s in segs:
+            if s["id"] in field_values:
+                continue
             rect = rects[s["id"]]
+            value = fields.get(s["id"])
             size = s["size"]
             if s.get("scanned"):
                 box = pymupdf.Rect(write_box[s["id"]])
@@ -501,16 +535,24 @@ def render(
             css = (
                 f"* {{font-family: sans-serif; font-size: {size}pt; color: {s['color']};"
                 f" line-height: {lh}; margin: 0; padding: 0;"
-                f" font-weight: {'bold' if s['bold'] else 'normal'};"
+                f" font-weight: {'bold' if s['bold'] and value is None else 'normal'};"
                 f" direction: {'rtl' if rtl else 'ltr'}; text-align: {'right' if rtl else 'left'};"
                 f" vertical-align: baseline; }}"
             )
             text = translations.get(s["id"], identity.get(s["id"], s["text"]))
+            bold_label = s.get("bold_label", False)
+            if value is not None:
+                value_text = translations.get(value["id"], identity.get(value["id"], value["text"]))
+                text = " ".join(text.split()).rstrip(":") + ": " + " ".join(value_text.split())
+                bold_label = True
+                rect.y1 = write_box[s["id"]][3]
             drawn = ltr_signs(text) if rtl else text
-            body = _html(drawn, s.get("bold_label", False), s.get("bold", False))
-            fit, scale, mode = _write_at_floor(page, rect, body, css, text)
-            results.append(
-                {"id": s["id"], "page": page_no, "fit": fit, "scale": round(scale, 3), "mode": mode}
+            body = _html(drawn, bold_label, s.get("bold", False))
+            fit, scale, mode = _write_at_floor(page, rect, body, css, text, fixed=value is not None)
+            ids = (s["id"], value["id"]) if value is not None else (s["id"],)
+            results.extend(
+                {"id": sid, "page": page_no, "fit": fit, "scale": round(scale, 3), "mode": mode}
+                for sid in ids
             )
 
     doc.subset_fonts()
