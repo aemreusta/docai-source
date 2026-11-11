@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import unicodedata
 from typing import Any
 
@@ -44,6 +45,35 @@ def check_page(doc: pymupdf.Document, page: pymupdf.Page) -> None:
         raise DocError("page-too-large")
 
 
+PREVIEW_SAMPLE_CHARS = 8000
+PREVIEW_MIN_LETTERS = 40
+PREVIEW_OCR_PAGES = 1
+PREVIEW_OCR_DPI = 150
+PREVIEW_OCR_BUDGET_S = 15.0
+
+
+def _letters(text: str) -> int:
+    return sum(1 for ch in text if ch.isalpha())
+
+
+def _preview_ocr(doc: pymupdf.Document, budget_s: float = PREVIEW_OCR_BUDGET_S) -> str:
+    if ocr.tesseract() is None or doc.page_count == 0:
+        return ""
+    deadline = time.monotonic() + budget_s
+    first = doc[0].get_pixmap(dpi=PREVIEW_OCR_DPI, colorspace=pymupdf.csGRAY).tobytes("png")
+    choice = ocr.choose(None, first)
+    chunks: list[str] = []
+    for number in range(min(PREVIEW_OCR_PAGES, doc.page_count)):
+        if time.monotonic() > deadline:
+            break
+        page = doc[number]
+        textpage = _ocr_page(page, choice.packs, PREVIEW_OCR_DPI)
+        if textpage is None:
+            break
+        chunks.append(page.get_text("text", textpage=textpage))
+    return "\n".join(chunks)
+
+
 def preview_pdf(data: bytes) -> tuple[int, str, list[bytes]]:
     doc = open_pdf(data)
     chunks, thumbs = [], []
@@ -56,7 +86,10 @@ def preview_pdf(data: bytes) -> tuple[int, str, list[bytes]]:
         if max(pix.width, pix.height) > 160:
             raise DocError("thumbnail")
         thumbs.append(pix.tobytes("jpeg"))
-    return doc.page_count, "\n".join(chunks)[:8000], thumbs
+    text = "\n".join(chunks)
+    if _letters(text) < PREVIEW_MIN_LETTERS:
+        text = _preview_ocr(doc) or text
+    return doc.page_count, text[:PREVIEW_SAMPLE_CHARS], thumbs
 
 
 def page_image(data: bytes, page: int, longest_px: int = 1000) -> bytes:
