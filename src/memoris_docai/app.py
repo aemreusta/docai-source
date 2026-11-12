@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from . import guard, images, storage
+from . import auth, guard, images, storage
 from .docx import pdf_to_docx
 from .layout import DocError, extract, page_image, preview_pdf, segment
 from .render import render
@@ -21,6 +21,7 @@ TIMEOUT_DOCX = 110
 TIMEOUT_REPORT = 110
 
 app = FastAPI(title="memoris-docai", docs_url=None, redoc_url=None)
+app.add_middleware(auth.ServiceAuthMiddleware)
 store: storage.Storage = storage.from_env()
 
 

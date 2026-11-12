@@ -240,6 +240,29 @@ def soft_join(text: str) -> str:
 
 _SIGNED = re.compile(r"(?<![\w)\]])([-+\u2212])(?=[.,]?[0-9])")
 _RANGE_SOFT_HYPHEN = re.compile(r"(?<=\d)([^\S\n]*)\u00ad([^\S\n]*)(?=[+\-\u2212]?\d)")
+_DECIMAL_CELL = re.compile(r"(?:[<>=≤≥]\s*)?[+−-]?([0-9]+)([,.])([0-9]+)")
+
+
+def _could_be_grouped(match: re.Match[str]) -> bool:
+    integer, _, fraction = match.groups()
+    return len(fraction) == 3 and len(integer) <= 3 and integer[0] != "0"
+
+
+def _preserve_decimal_comma(
+    source: dict[str, Any], text: str, decimal_cells: list[tuple[float, str]]
+) -> str:
+    original = source["text"].strip()
+    if "," not in original or text.strip() != original.replace(",", "."):
+        return text
+    match = _DECIMAL_CELL.fullmatch(original)
+    if match is None:
+        return text
+    if _could_be_grouped(match):
+        x = source["bbox"][0]
+        nearby = [separator for left, separator in decimal_cells if abs(left - x) <= 1]
+        if nearby.count(",") < 2 or "." in nearby:
+            return text
+    return original
 
 
 _NASKH_UNMAPPED = {
@@ -335,6 +358,51 @@ def _form_fields(segs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             ):
                 fields[label["id"]] = value
     return fields
+
+
+def _header_slots(
+    page: pymupdf.Page,
+    segs: list[dict[str, Any]],
+    boxes: dict[str, list[float]],
+    fields: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    align = {}
+    images = [pymupdf.Rect(info["bbox"]) for info in page.get_image_info()]
+    midpoint = (page.rect.x0 + page.rect.x1) / 2
+    values = {value["id"] for value in fields.values()}
+    candidates = [s for s in segs if s["id"] not in values and s["lines"] == 1]
+    labels = {s["id"] for s in candidates if s.get("bold_label") or s["id"] in fields}
+    for s in candidates:
+        sid = s["id"]
+        box = pymupdf.Rect(boxes[sid])
+        if sid in labels and box.x0 > midpoint and abs(box.x1 - (page.rect.x1 - PAGE_MARGIN)) <= 3:
+            left_id = max(
+                (
+                    other for other, b in boxes.items()
+                    if other not in values and b[2] <= box.x0 + 0.5 and _side_by_side(b, boxes[sid])
+                ),
+                key=lambda other: boxes[other][2],
+                default=None,
+            )
+            if left_id is not None and left_id in labels and boxes[left_id][0] < midpoint:
+                divider = max(midpoint, boxes[left_id][2] + 2)
+                boxes[sid][0] = min(box.x0, divider)
+                boxes[left_id][2] = max(boxes[left_id][2], boxes[sid][0] - 2)
+                align[sid] = "right"
+                align[left_id] = "left"
+        center = (box.x0 + box.x1) / 2
+        if sid in labels or abs(center - midpoint) > page.rect.width * 0.05:
+            continue
+        on_row = [im for im in images if im.y0 < box.y1 and im.y1 > box.y0]
+        left = max((im.x1 + 2 for im in on_row if im.x1 <= box.x0), default=None)
+        right = min((im.x0 - 2 for im in on_row if im.x0 >= box.x1), default=None)
+        if left is not None and right is not None and left <= box.x0 and right >= box.x1 and not any(
+            other != sid and _side_by_side(b, boxes[sid]) for other, b in boxes.items()
+        ):
+            radius = min(center - left, right - center)
+            boxes[sid] = [center - radius, box.y0, center + radius, box.y1]
+            align[sid] = "center"
+    return align
 
 
 def _vertical_grids(page: pymupdf.Page) -> list[list[dict[str, Any]]]:
@@ -468,8 +536,9 @@ def render(
     results = []
     for page_no, segs in by_page.items():
         page = doc[page_no]
+        scanned = any(s.get("scanned") for s in segs)
         grids: list[list[dict[str, Any]]] = []
-        if rtl and not any(s.get("scanned") for s in segs):
+        if rtl and not scanned:
             grids = mirror_grid_lines(page)
         lines = _obstacles(page)
         if rtl:
@@ -486,8 +555,9 @@ def render(
             label_box = pymupdf.Rect(write_box[label_id])
             label_box |= pymupdf.Rect(write_box[value["id"]])
             write_box[label_id] = list(label_box)
+        alignment = {} if rtl or scanned else _header_slots(page, segs, write_box, fields)
         rects = {
-            s["id"]: available(
+            s["id"]: pymupdf.Rect(write_box[s["id"]]) if s["id"] in alignment else available(
                 pymupdf.Rect(write_box[s["id"]]),
                 [pymupdf.Rect(write_box[o["id"]]) for o in all_by_page[page_no] if o["id"] != s["id"]],
                 [ln for ln in lines if not pymupdf.Rect(write_box[s["id"]]).contains(ln)],
@@ -497,7 +567,6 @@ def render(
             )
             for s in segs
         }
-        scanned = any(s.get("scanned") for s in segs)
         if scanned:
             pix = page.get_pixmap(dpi=72)
             for s in segs:
@@ -518,6 +587,12 @@ def render(
             )
         sizes = sorted(o["size"] for o in all_by_page[page_no])
         median = sizes[len(sizes) // 2] if sizes else 10.0
+        decimal_cells = []
+        if target_lang == "de":
+            for s in all_by_page[page_no]:
+                decimal = _DECIMAL_CELL.fullmatch(s["text"].strip())
+                if decimal is not None and not _could_be_grouped(decimal):
+                    decimal_cells.append((s["bbox"][0], decimal[2]))
         for s in segs:
             if s["id"] in field_values:
                 continue
@@ -532,14 +607,17 @@ def render(
                 )
             degree = "°" in (translations.get(s["id"]) or identity.get(s["id"]) or s["text"])
             lh = "1.0" if degree else "1.15"
+            text_align = alignment.get(s["id"], "right" if rtl else "left")
             css = (
                 f"* {{font-family: sans-serif; font-size: {size}pt; color: {s['color']};"
                 f" line-height: {lh}; margin: 0; padding: 0;"
                 f" font-weight: {'bold' if s['bold'] and value is None else 'normal'};"
-                f" direction: {'rtl' if rtl else 'ltr'}; text-align: {'right' if rtl else 'left'};"
+                f" direction: {'rtl' if rtl else 'ltr'}; text-align: {text_align};"
                 f" vertical-align: baseline; }}"
             )
             text = translations.get(s["id"], identity.get(s["id"], s["text"]))
+            if target_lang == "de":
+                text = _preserve_decimal_comma(s, text, decimal_cells)
             bold_label = s.get("bold_label", False)
             if value is not None:
                 value_text = translations.get(value["id"], identity.get(value["id"], value["text"]))
@@ -548,7 +626,9 @@ def render(
                 rect.y1 = write_box[s["id"]][3]
             drawn = ltr_signs(text) if rtl else text
             body = _html(drawn, bold_label, s.get("bold", False))
-            fit, scale, mode = _write_at_floor(page, rect, body, css, text, fixed=value is not None)
+            fit, scale, mode = _write_at_floor(
+                page, rect, body, css, text, fixed=value is not None or s["id"] in alignment
+            )
             ids = (s["id"], value["id"]) if value is not None else (s["id"],)
             results.extend(
                 {"id": sid, "page": page_no, "fit": fit, "scale": round(scale, 3), "mode": mode}
