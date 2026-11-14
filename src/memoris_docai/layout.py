@@ -269,8 +269,7 @@ def extract(data: bytes, source_lang: str | None = None, pages: list[int] | None
                     blocks.append({"bbox": list(b["bbox"]), "lines": lines})
                 continue
             lines = _join_ocr_words(lines)
-            if choice is not None and choice.language in ocr.CYRILLIC:
-                _fix_units(lines)
+            _fix_ocr_text(lines, cyrillic=choice is not None and choice.language in ocr.CYRILLIC)
             groups = _split_columns(lines)
             if len(groups) == 1:
                 blocks.append({"bbox": list(b["bbox"]), "lines": groups[0]})
@@ -376,11 +375,14 @@ def _split_columns(lines: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return groups
 
 
-def _fix_units(lines: list[dict[str, Any]]) -> None:
+def _fix_ocr_text(lines: list[dict[str, Any]], cyrillic: bool) -> None:
     for ln in lines:
         prev = ""
         for span in ln["spans"]:
-            span["text"] = ocr.fix_units(span["text"], prev.rstrip()[-1:].isdigit())
+            text = ocr.fix_terms(span["text"])
+            if cyrillic:
+                text = ocr.fix_units(text, prev.rstrip()[-1:].isdigit())
+            span["text"] = text
             if span["text"].strip():
                 prev = span["text"]
 

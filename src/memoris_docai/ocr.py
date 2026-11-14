@@ -187,3 +187,10 @@ def fix_units(text: str, after_number: bool) -> str:
     if after_number:
         text = _UNIT_AT_START.sub(r"\1мг", text)
     return text
+
+
+_HBA1C = re.compile(r"(?<![^\W_])[HН][bБЬь6][AА][1iIlt|ıі]{1,2}[cс](?![^\W_])")
+
+
+def fix_terms(text: str) -> str:
+    return _HBA1C.sub("HbA1c", text)
