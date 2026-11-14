@@ -20,6 +20,7 @@ REGISTRY: dict[str, str] = {
     "nl": "nld",
 }
 DEFAULT_LANGUAGES = "tr,en,de,ar,fr,ru"
+CYRILLIC = frozenset({"ru"})
 FALLBACK = "tur+eng"
 TIMEOUT_S = 60
 
@@ -175,3 +176,14 @@ def confidence(png: bytes, packs: str) -> float | None:
 
 RETRY_DPI = (200, 150)
 MIN_COVERAGE = 0.6
+
+
+_UNIT_AFTER_NUMBER = re.compile(r"(\d\s*)mr\b")
+_UNIT_AT_START = re.compile(r"^(\s*)mr\b")
+
+
+def fix_units(text: str, after_number: bool) -> str:
+    text = _UNIT_AFTER_NUMBER.sub(r"\1мг", text)
+    if after_number:
+        text = _UNIT_AT_START.sub(r"\1мг", text)
+    return text

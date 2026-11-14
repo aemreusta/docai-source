@@ -266,6 +266,8 @@ def extract(data: bytes, source_lang: str | None = None, pages: list[int] | None
                 lines.extend(_lines_from(ln))
             if textpage is not None:
                 lines = _join_ocr_words(lines)
+                if choice is not None and choice.language in ocr.CYRILLIC:
+                    _fix_units(lines)
             if lines:
                 blocks.append({"bbox": list(b["bbox"]), "lines": lines})
         out = {
@@ -337,6 +339,15 @@ def _join_ocr_words(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _fix_units(lines: list[dict[str, Any]]) -> None:
+    for ln in lines:
+        prev = ""
+        for span in ln["spans"]:
+            span["text"] = ocr.fix_units(span["text"], prev.rstrip()[-1:].isdigit())
+            if span["text"].strip():
+                prev = span["text"]
 
 
 def _ocr_page(page: pymupdf.Page, packs: str, dpi: int):
