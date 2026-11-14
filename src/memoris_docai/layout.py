@@ -264,12 +264,19 @@ def extract(data: bytes, source_lang: str | None = None, pages: list[int] | None
             lines = []
             for ln in b["lines"]:
                 lines.extend(_lines_from(ln))
-            if textpage is not None:
-                lines = _join_ocr_words(lines)
-                if choice is not None and choice.language in ocr.CYRILLIC:
-                    _fix_units(lines)
-            if lines:
-                blocks.append({"bbox": list(b["bbox"]), "lines": lines})
+            if textpage is None:
+                if lines:
+                    blocks.append({"bbox": list(b["bbox"]), "lines": lines})
+                continue
+            lines = _join_ocr_words(lines)
+            if choice is not None and choice.language in ocr.CYRILLIC:
+                _fix_units(lines)
+            groups = _split_columns(lines)
+            if len(groups) == 1:
+                blocks.append({"bbox": list(b["bbox"]), "lines": groups[0]})
+                continue
+            for g in groups:
+                blocks.append({"bbox": _bbox(g), "lines": g})
         out = {
             "number": page.number,
             "width": page.rect.width,
@@ -313,7 +320,7 @@ def _join_ocr_words(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
         rows.append([ln])
     out = []
-    for row in rows:
+    for row in (run for r in rows for run in _column_runs(r, height)):
         if len(row) == 1:
             out.append(row[0])
             continue
@@ -339,6 +346,34 @@ def _join_ocr_words(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+COLUMN_GAP = 3.0
+
+
+def _column_runs(row: list[dict[str, Any]], height) -> list[list[dict[str, Any]]]:
+    row = sorted(row, key=lambda x: x["bbox"][0])
+    runs = [[row[0]]]
+    for ln in row[1:]:
+        prev = runs[-1][-1]
+        gap = ln["bbox"][0] - prev["bbox"][2]
+        if gap > COLUMN_GAP * min(height(ln), height(prev)):
+            runs.append([ln])
+        else:
+            runs[-1].append(ln)
+    return runs
+
+
+def _split_columns(lines: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for ln in lines:
+        for g in groups:
+            if any(ln["bbox"][0] < o["bbox"][2] and o["bbox"][0] < ln["bbox"][2] for o in g):
+                g.append(ln)
+                break
+        else:
+            groups.append([ln])
+    return groups
 
 
 def _fix_units(lines: list[dict[str, Any]]) -> None:
