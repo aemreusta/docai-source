@@ -48,7 +48,7 @@ def pdf_to_docx(data: bytes) -> tuple[bytes, dict]:
         try:
             cv = Converter(str(src))
             try:
-                cv.convert(str(out), multi_processing=False)
+                cv.convert(str(out), multi_processing=False, parse_stream_table=True)
             finally:
                 cv.close()
         except DocError:
@@ -80,6 +80,109 @@ def _bake_widgets(doc: pymupdf.Document) -> bytes:
     return doc.tobytes()
 
 
+_FORM_FIELD_LINE = re.compile(r"^[^\n:]{1,48}:\s*\S")
+
+
+def _merged_form_lines(text: str) -> list[str]:
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return []
+    if not all(_FORM_FIELD_LINE.match(ln) for ln in lines):
+        return []
+    return lines
+
+
+def _run_has_drawing(r_elm) -> bool:
+    return bool(r_elm.findall(qn("w:drawing")))
+
+
+def _set_run_text_preserve(r_elm, text: str) -> None:
+    texts = r_elm.findall(qn("w:t"))
+    if not texts:
+        if not text and _run_has_drawing(r_elm):
+            return
+        t = OxmlElement("w:t")
+        if text[:1].isspace() or text[-1:].isspace():
+            t.set(qn("xml:space"), "preserve")
+        t.text = text
+        r_elm.append(t)
+        return
+    texts[0].text = text
+    if text[:1].isspace() or text[-1:].isspace():
+        texts[0].set(qn("xml:space"), "preserve")
+    else:
+        if texts[0].get(qn("xml:space")) is not None and not text:
+            pass
+    for extra in texts[1:]:
+        r_elm.remove(extra)
+
+
+def _form_line_run_groups(paragraph: Paragraph) -> list[list]:
+    groups: list[list] = [[]]
+    for run in paragraph.runs:
+        r_elm = run._r
+        text = run.text or ""
+        drawing = _run_has_drawing(r_elm)
+        if "\n" not in text:
+            if text or drawing:
+                clone = deepcopy(r_elm)
+                groups[-1].append(clone)
+            continue
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if i > 0:
+                groups.append([])
+            if not part and not (drawing and i == 0):
+                continue
+            clone = deepcopy(r_elm)
+            _set_run_text_preserve(clone, part)
+            if i > 0 and _run_has_drawing(clone):
+                for d in list(clone.findall(qn("w:drawing"))):
+                    clone.remove(d)
+            if part or (drawing and i == 0):
+                groups[-1].append(clone)
+    return [g for g in groups if g]
+
+
+def _replace_paragraph_runs(paragraph: Paragraph, run_elms: list) -> None:
+    p = paragraph._p
+    for child in list(p):
+        if child.tag == qn("w:r"):
+            p.remove(child)
+    for r_elm in run_elms:
+        p.append(r_elm)
+
+
+def _split_form_paragraph_list(paragraphs: list[Paragraph]) -> None:
+    for paragraph in list(paragraphs):
+        if not _merged_form_lines(paragraph.text or ""):
+            continue
+        parent = paragraph._p.getparent()
+        if parent is None:
+            continue
+        groups = _form_line_run_groups(paragraph)
+        if len(groups) < 2:
+            continue
+        _replace_paragraph_runs(paragraph, groups[0])
+        index = list(parent).index(paragraph._p) + 1
+        for group in groups[1:]:
+            clone_p = deepcopy(paragraph._p)
+            for child in list(clone_p):
+                if child.tag == qn("w:r"):
+                    clone_p.remove(child)
+            for r_elm in group:
+                clone_p.append(r_elm)
+            parent.insert(index, clone_p)
+            index += 1
+
+
+def _split_merged_form_paragraphs(d: Document) -> None:
+    _split_form_paragraph_list(list(d.paragraphs))
+    for table in d.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                _split_form_paragraph_list(list(cell.paragraphs))
+
 def _polish(docx: bytes, pdf: bytes) -> bytes:
     d = Document(io.BytesIO(docx))
     src = pymupdf.open(stream=pdf)
@@ -90,6 +193,7 @@ def _polish(docx: bytes, pdf: bytes) -> bytes:
         marks = _script_marks(src)
         chunks = _pdf_chunks(src)
         lines = _Lines(chunks)
+        _split_merged_form_paragraphs(d)
         for paragraph in _body_paragraphs(d):
             _logical_order(paragraph, lines)
             _restore_spaces(paragraph, pdf_text)
@@ -157,7 +261,7 @@ def _restore_spaces(paragraph: Paragraph, pdf_text: str) -> None:
         return
     for run, text in zip(runs, kept):
         if (run.text or "") != text:
-            run.text = text
+            _set_run_text_preserve(run._r, text)
 
 
 def _pdf_tokens(pdf_text: str) -> list[str]:
@@ -733,9 +837,12 @@ def _mark_rtl(paragraph: Paragraph) -> None:
         text = run.text or ""
         signed = ltr_signs(text)
         if signed != text:
-            run.text = signed
+            _set_run_text_preserve(run._r, signed)
+            text = signed
         if not _has_rtl(text):
-            run.text = _ltr_island(run.text or "")
+            island = _ltr_island(text)
+            if island != text:
+                _set_run_text_preserve(run._r, island)
             continue
         r_pr = run._r.get_or_add_rPr()
         if r_pr.find(qn("w:rtl")) is None:
