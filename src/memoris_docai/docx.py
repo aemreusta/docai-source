@@ -13,7 +13,8 @@ import pymupdf
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, Twips
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pdf2docx import Converter
 
@@ -185,6 +186,8 @@ def _split_merged_form_paragraphs(d: Document) -> None:
 
 def _polish(docx: bytes, pdf: bytes) -> bytes:
     d = Document(io.BytesIO(docx))
+    for element in d.element.body.iter(qn("w:tbl")):
+        _sync_table_grid(Table(element, d))
     src = pymupdf.open(stream=pdf)
     try:
         pdf_text = unicodedata.normalize(
@@ -219,6 +222,33 @@ def _polish(docx: bytes, pdf: bytes) -> bytes:
     buf = io.BytesIO()
     d.save(buf)
     return buf.getvalue()
+
+
+def _sync_table_grid(table: Table) -> None:
+    widths = {}
+    for row in table.rows:
+        column = row.grid_cols_before
+        for cell in row._tr.tc_lst:
+            if cell.grid_span == 1 and cell.vMerge != "continue" and cell.width:
+                width = cell.width.twips
+                if widths.setdefault(column, width) != width:
+                    return
+            column += cell.grid_span
+    columns = list(table.columns)
+    if set(widths) != set(range(len(columns))):
+        return
+    for i, column in enumerate(columns):
+        column.width = Twips(widths[i])
+    preferred = table._tbl.tblPr.find(qn("w:tblW"))
+    preferred.set(qn("w:type"), "dxa")
+    preferred.set(qn("w:w"), str(sum(widths.values())))
+    for row in table.rows:
+        column = row.grid_cols_before
+        for cell in row._tr.tc_lst:
+            end = column + cell.grid_span
+            if cell.vMerge == "continue":
+                cell.width = Twips(sum(widths[i] for i in range(column, end)))
+            column = end
 
 
 def _body_paragraphs(d: Document) -> list[Paragraph]:

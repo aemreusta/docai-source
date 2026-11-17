@@ -132,9 +132,17 @@ def _piled_label(chars: list[dict[str, Any]], start: int) -> int:
         if abs(box[0] - edge) > 1 and abs(box[2] - edge) > 1:
             break
         end += 1
-    if end >= start + 3:
-        return end - start
-    return 0
+    if end < start + 3:
+        return 0
+    label = "".join(c["c"] for c in chars[start:end])
+    if (
+        start
+        and label.islower()
+        and chars[start - 1]["c"].isalpha()
+        and abs(chars[start]["bbox"][0] - chars[start - 1]["bbox"][2]) <= 0.5
+    ):
+        return 0
+    return end - start
 
 
 def _span_from(src: dict[str, Any], chars: list[dict[str, Any]], icon: bool) -> dict[str, Any]:
@@ -203,15 +211,25 @@ def _lines_from(ln: dict[str, Any]) -> list[dict[str, Any]]:
             groups.append(current)
             current = []
 
+    word_space = False
     for src in ln["spans"]:
+        if src.get("chars") and all(c["c"].isspace() for c in src["chars"]):
+            word_space = True
+            continue
         for piece in _pieces(src):
             if piece["icon"]:
                 flush()
                 groups.append([piece])
+                word_space = False
                 continue
-            if current and piece["bbox"][0] > current[-1]["bbox"][2] + 1:
-                flush()
+            if current:
+                previous = current[-1]
+                same_style = all(piece[key] == previous[key] for key in ("font", "size", "color", "bold", "italic"))
+                gap_limit = max(1, piece["size"] * 0.65) if word_space and same_style else 1
+                if piece["bbox"][0] > previous["bbox"][2] + gap_limit:
+                    flush()
             current.append(piece)
+            word_space = False
     flush()
     return [
         {
@@ -423,7 +441,7 @@ def _side_by_side(a: list[float], b: list[float]) -> bool:
 def _units(block: dict[str, Any]) -> list[list[dict[str, Any]]]:
     lines = block["lines"]
     if any(_side_by_side(a["bbox"], b["bbox"]) for i, a in enumerate(lines) for b in lines[i + 1 :]):
-        return [[ln] for ln in lines]
+        return _wrapped_cells(lines)
     units = []
     previous = None
     for ln in lines:
@@ -433,6 +451,31 @@ def _units(block: dict[str, Any]) -> list[list[dict[str, Any]]]:
             units.append([])
         units[-1].append(ln)
         previous = style
+    return units
+
+
+def _wrapped_cells(lines: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    units: list[list[dict[str, Any]]] = []
+    for line in lines:
+        x0, y0, _, y1 = line["bbox"]
+        inline = any(_side_by_side(line["bbox"], other["bbox"]) for other in lines if other is not line)
+        candidates = []
+        if not inline and not any(_is_icon(span) for span in line["spans"]):
+            for unit in units:
+                previous = unit[-1]
+                px, py, _, _ = previous["bbox"]
+                if (
+                    abs(x0 - px) <= 1.5
+                    and 0.75 * (y1 - y0) <= y0 - py <= 1.35 * (y1 - y0)
+                    and previous["dir"] == line["dir"] == [1.0, 0.0]
+                    and _dominant(previous["spans"], "bold") == _dominant(line["spans"], "bold")
+                    and not any(_is_icon(span) for span in previous["spans"])
+                ):
+                    candidates.append(unit)
+        if len(candidates) == 1:
+            candidates[0].append(line)
+        else:
+            units.append([line])
     return units
 
 
@@ -533,7 +576,7 @@ def _join_spans(spans: list[dict[str, Any]]) -> str:
             base = span
         if out and text:
             glued = not prev[-1:].isspace() and not raw[:1].isspace()
-            if not (glued and (_value_bearing(out[-1]) or _value_bearing(text[0]))):
+            if text[0] not in ",;.!?" and not (glued and (_value_bearing(out[-1]) or _value_bearing(text[0]))):
                 out += " "
         out += text
         if text:
@@ -544,7 +587,7 @@ def _join_spans(spans: list[dict[str, Any]]) -> str:
 def segment(layout: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for p in layout["pages"]:
-        for i, b in enumerate(p["blocks"]):
+        for i, b in _sentence_blocks(p["blocks"]):
             for u, lines in enumerate(_units(b)):
                 icons = [s for ln in lines for s in ln["spans"] if _is_icon(s)]
                 text_lines = [{**ln, "spans": [s for s in ln["spans"] if not _is_icon(s)]} for ln in lines]
@@ -590,6 +633,40 @@ def segment(layout: dict[str, Any]) -> list[dict[str, Any]]:
                     }
                 )
     return out
+
+
+_DANGLING_SENTENCE_START = re.compile(r"[.!?]\s+([^\W\d_]+)\s*$")
+
+
+def _sentence_blocks(blocks: list[dict[str, Any]]):
+    i = 0
+    while i < len(blocks):
+        start, block = i, blocks[i]
+        i += 1
+        if i < len(blocks) and _continues_sentence(block, blocks[i]):
+            lines = block["lines"] + blocks[i]["lines"]
+            block = {**block, "lines": lines, "bbox": _bbox(lines)}
+            i += 1
+        yield start, block
+
+
+def _continues_sentence(block: dict[str, Any], following: dict[str, Any]) -> bool:
+    if any(len(candidate["lines"]) != 1 for candidate in (block, following)):
+        return False
+    first, second = block["lines"][0], following["lines"][0]
+    a, b = first["bbox"], second["bbox"]
+    if abs(a[0] - b[0]) > 1.5 or not 0 <= b[1] - a[3] <= a[3] - a[1]:
+        return False
+    spans = first["spans"] + second["spans"]
+    if first["dir"] != [1.0, 0.0] or second["dir"] != first["dir"]:
+        return False
+    if any(_is_icon(s) or s["bold"] or s.get("italic") for s in spans):
+        return False
+    if any((s["font"], s["size"], s["color"]) != (spans[0]["font"], spans[0]["size"], spans[0]["color"]) for s in spans):
+        return False
+    opening = _DANGLING_SENTENCE_START.search(_join_spans(first["spans"]))
+    continuation = _join_spans(second["spans"]).lstrip()
+    return bool(opening and opening[1].istitle() and continuation[:1].islower())
 
 
 _DECIMAL_COMMA = re.compile(r"\d,\d")
